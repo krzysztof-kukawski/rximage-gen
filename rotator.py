@@ -3,16 +3,9 @@ import os
 import numpy as np
 import tensorflow as tf
 from PIL import Image, ImageOps
-import matplotlib.pyplot as plt
 
 
-def rotate_resize_pad(
-    image_path,
-    output_dir,
-    angles=[90, 180, 270],
-    target_size=(300, 255),
-    fill_color=(0, 0, 0),
-):
+def rotate_resize_pad(image_path, output_dir, angles=[90, 180, 270], target_size=(300, 255), fill_color=(0, 0, 0)):
     os.makedirs(output_dir, exist_ok=True)
 
     original = Image.open(image_path).convert("RGB")
@@ -30,7 +23,7 @@ def rotate_resize_pad(
             delta_w // 2,
             delta_h // 2,
             delta_w - (delta_w // 2),
-            delta_h - (delta_h // 2),
+            delta_h - (delta_h // 2)
         )
         return ImageOps.expand(image, padding, fill=fill_color)
 
@@ -43,7 +36,8 @@ def rotate_resize_pad(
         final_img.save(filename)
 
 
-def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(225, 300)):
+def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(255, 300)):
+    # Load image using PIL
     image = Image.open(image_path).convert("RGB")
 
     all_versions = []
@@ -56,60 +50,26 @@ def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(225, 300
         w, h = rotated.size
         pad_w = target_size[1] - w
         pad_h = target_size[0] - h
-        padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+        padding = (
+            pad_w // 2,
+            pad_h // 2,
+            pad_w - pad_w // 2,
+            pad_h - pad_h // 2
+        )
         padded = ImageOps.expand(rotated, padding, fill=(0, 0, 0))
-        padded = tf.convert_to_tensor(padded, dtype=tf.float32)
-        image_tensor = (padded / 127.5) - 1
 
-        light_gray = tf.constant(
-            [-0.08, -0.08, -0.08], dtype=tf.float32
-        )  
-        left_width = 25
-        bottom_height = 15
-        height = tf.shape(image_tensor)[0]
-        width = tf.shape(image_tensor)[1]
+        image_tensor = (tf.convert_to_tensor(np.array(padded), dtype=tf.float32) / 255)
 
-        mask = tf.ones_like(image_tensor) * image_tensor  
-
-        left_mask = tf.ones([height, left_width, 3], dtype=tf.float32) * light_gray
-        mask = tf.tensor_scatter_nd_update(
-            mask,
-            tf.reshape(
-                tf.stack(
-                    tf.meshgrid(tf.range(height), tf.range(left_width), indexing="ij"),
-                    axis=-1,
-                ),
-                [-1, 2],
-            ),
-            tf.reshape(left_mask, [-1, 3]),
-        )
-
-        bottom_mask = tf.ones([bottom_height, width, 3], dtype=tf.float32) * light_gray
-        mask = tf.tensor_scatter_nd_update(
-            mask,
-            tf.reshape(
-                tf.stack(
-                    tf.meshgrid(
-                        tf.range(height - bottom_height, height),
-                        tf.range(width),
-                        indexing="ij",
-                    ),
-                    axis=-1,
-                ),
-                [-1, 2],
-            ),
-            tf.reshape(bottom_mask, [-1, 3]),
-        )
-        all_versions.append(mask)
+        all_versions.append(image_tensor)
 
     return tf.stack(all_versions)
 
 
 def preprocess_directory_tf(
-    image_dir,
-    target_size=(255, 300),
-    angles=[90, 180, 270],
-    allowed_exts=[".png", ".jpg", ".jpeg"],
+        image_dir,
+        target_size=(255, 300),
+        angles=[90, 180, 270],
+        allowed_exts=[".png", ".jpg", ".jpeg"]
 ):
     image_paths = [
         os.path.join(image_dir, fname)
@@ -132,8 +92,5 @@ def preprocess_directory_tf(
 
 
 def image_generator(image_paths, angles, target_size):
-    try:
-        for path in image_paths:
-            yield from preprocess_image_tf(path, angles=angles, target_size=target_size)
-    finally:
-        print("skip")
+    for path in image_paths:
+        yield from preprocess_image_tf(path, angles=angles, target_size=target_size)

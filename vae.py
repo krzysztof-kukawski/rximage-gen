@@ -1,3 +1,4 @@
+# tf-env/bin/python3.10
 import os
 
 import matplotlib.pyplot as plt
@@ -6,37 +7,38 @@ from tensorflow.keras import layers
 
 from rotator import image_generator
 
-BATCH_SIZE = 4
-images_120 = "data/600"
+BATCH_SIZE = 32
+images_120 = "data/300"
+print(tf.test.is_built_with_cuda())
 allowed_exts = [".png", ".jpg", ".jpeg"]
 image_paths = [
     os.path.join(images_120, fname)
-    for fname in os.listdir(images_120)[:6000]
+    for fname in os.listdir(images_120)
     if os.path.splitext(fname.lower())[1] in allowed_exts and "NLMIMAGE" in fname
 ]
+print("LEN!!!", len(image_paths))
 NUM_SAMPLES = len(image_paths)
-latent_dim = 64
-
+latent_dim = 128
 
 
 def create_dataset(image_dir, batch_size=32):
     dataset = tf.data.Dataset.from_generator(
-        lambda: image_generator(image_paths, angles=[0], target_size=(450, 600, 3)),
-        output_signature=tf.TensorSpec(shape=(450, 600, 3), dtype=tf.float32),
+        lambda: image_generator(image_paths, angles=[0], target_size=(225, 300)),
+        output_signature=tf.TensorSpec(shape=(225, 300, 3), dtype=tf.float32)
     )
     return dataset.shuffle(1000).batch(batch_size).prefetch(tf.data.AUTOTUNE).repeat()
 
 
-def build_encoder(input_shape=(450, 600, 3)):
+def build_encoder(input_shape=(225, 300, 3)):
     inputs = tf.keras.Input(shape=input_shape)
-    x = layers.Conv2D(32, 4, strides=2, padding="same", activation="relu")(inputs)
-    x = layers.Conv2D(64, 4, strides=2, padding="same", activation="relu")(x)
-    x = layers.Conv2D(128, 4, strides=2, padding="same", activation="relu")(x)
+    x = layers.Conv2D(64, 4, strides=2, padding='same', activation='relu')(inputs)
+    x = layers.Conv2D(128, 4, strides=2, padding='same', activation='relu')(x)
+    x = layers.Conv2D(256, 4, strides=2, padding='same', activation='relu')(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(128, activation="relu")(x)
-    z_mean = layers.Dense(latent_dim, name="z_mean")(x)
-    z_log_var = layers.Dense(latent_dim, name="z_log_var")(x)
-    return tf.keras.Model(inputs, [z_mean, z_log_var], name="encoder")
+    x = layers.Dense(256, activation='relu')(x)
+    z_mean = layers.Dense(latent_dim, name='z_mean')(x)
+    z_log_var = layers.Dense(latent_dim, name='z_log_var')(x)
+    return tf.keras.Model(inputs, [z_mean, z_log_var], name='encoder')
 
 
 class Sampling(layers.Layer):
@@ -47,26 +49,20 @@ class Sampling(layers.Layer):
 
 
 def build_decoder(latent_dim):
-    decoder = tf.keras.models.Sequential(
-        [
-            layers.Input(shape=(latent_dim,)),
-            layers.Dense(57 * 75 * 128, activation="relu"),  
-            layers.Reshape((57, 75, 128)),  
-            layers.Conv2DTranspose(
-                64, 3, strides=2, padding="same", activation="relu"
-            ),  
-            layers.Conv2DTranspose(
-                32, 3, strides=2, padding="same", activation="relu"
-            ), 
-            layers.Conv2DTranspose(
-                16, 3, strides=2, padding="same", activation="relu"
-            ), 
-            layers.Conv2DTranspose(
-                3, 3, strides=1, padding="same", activation="sigmoid"
-            ), 
-            layers.Cropping2D(((3, 3), (0, 0))),  
-        ]
-    )
+    decoder = tf.keras.models.Sequential([
+        layers.Input(shape=(latent_dim,)),
+
+        layers.Dense(29 * 38 * 128, activation='relu'),
+        layers.Reshape((29, 38, 128)),
+
+        layers.Conv2DTranspose(128, 3, strides=2, padding='same', activation='relu'),
+        layers.Conv2DTranspose(64, 3, strides=2, padding='same', activation='relu'),
+
+        layers.Conv2DTranspose(32, 3, strides=2, padding='same', activation='relu'),
+
+        layers.Conv2DTranspose(3, kernel_size=3, strides=1, padding='same', activation='sigmoid'),
+        layers.Cropping2D(((3, 4), (2, 2)))
+    ])
 
     return decoder
 
@@ -78,9 +74,7 @@ class VAE(tf.keras.Model):
         self.decoder = decoder
         self.sampler = Sampling()
         self.total_loss_tracker = tf.keras.metrics.Mean(name="total_loss")
-        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(
-            name="reconstruction_loss"
-        )
+        self.reconstruction_loss_tracker = tf.keras.metrics.Mean(name="reconstruction_loss")
         self.kl_loss_tracker = tf.keras.metrics.Mean(name="kl_loss")
 
     def call(self, inputs):
@@ -97,15 +91,14 @@ class VAE(tf.keras.Model):
             z = self.sampler([z_mean, z_log_var])
             reconstruction = self.decoder(z)
             reconstruction_loss = tf.keras.losses.binary_crossentropy(
-                data, reconstruction
+                data,
+                reconstruction
             )
 
             reconstruction_loss = tf.reduce_sum(reconstruction_loss, axis=[1, 2])
             reconstruction_loss = tf.reduce_mean(reconstruction_loss)
             kl_loss = -0.5 * tf.reduce_mean(
-                tf.reduce_sum(
-                    1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1
-                )
+                tf.reduce_sum(1 + z_log_var - tf.square(z_mean) - tf.exp(z_log_var), axis=1)
             )
             total_loss = reconstruction_loss + kl_loss
 
@@ -131,18 +124,18 @@ class VAE(tf.keras.Model):
         ]
 
 
-def save_reconstructed_images(model, dataset, epoch, output_dir="vae_outputs"):
+def save_reconstructed_images(model, dataset, epoch, output_dir='vae_outputs'):
     os.makedirs(output_dir, exist_ok=True)
     for images in dataset.take(1):
         reconstructed = model(images, training=False)
         for i in range(min(5, images.shape[0])):
-            fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
             axes[0].imshow(images[i].numpy())
-            axes[0].set_title("Original")
-            axes[0].axis("off")
+            axes[0].set_title('Original')
+            axes[0].axis('off')
             axes[1].imshow(reconstructed[i].numpy())
-            axes[1].set_title("Reconstructed")
-            axes[1].axis("off")
+            axes[1].set_title('Reconstructed')
+            axes[1].axis('off')
             plt.savefig(os.path.join(output_dir, f"epoch_{epoch}_img_{i}.png"))
             plt.close()
 
@@ -153,7 +146,7 @@ def train_vae(image_dir, epochs=50, batch_size=16, save_interval=5):
     encoder = build_encoder()
     decoder = build_decoder(latent_dim)
     vae = VAE(encoder, decoder)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4)
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
     vae.compile(optimizer, loss=tf.keras.losses.MeanSquaredError())
 
     for epoch in range(1, epochs + 1):
@@ -162,7 +155,6 @@ def train_vae(image_dir, epochs=50, batch_size=16, save_interval=5):
 
         if epoch % save_interval == 0 or epoch == epochs:
             save_reconstructed_images(vae, dataset, epoch)
-            vae.save("rx-image-gen.keras")
 
 
-train_vae(image_dir="vae_img", epochs=900, batch_size=BATCH_SIZE)
+train_vae(image_dir='vae_img', epochs=900, batch_size=BATCH_SIZE)
