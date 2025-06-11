@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 import tensorflow as tf
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 
 
 def rotate_resize_pad(image_path, output_dir, angles=[90, 180, 270], target_size=(300, 255), fill_color=(0, 0, 0)):
@@ -36,9 +36,16 @@ def rotate_resize_pad(image_path, output_dir, angles=[90, 180, 270], target_size
         final_img.save(filename)
 
 
-def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(255, 300)):
-    # Load image using PIL
+def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(255, 300), 
+                        bottom_mask_height=5, left_mask_width=2):
     image = Image.open(image_path).convert("RGB")
+
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+
+    draw.rectangle([(0, height - bottom_mask_height), (width, height)], fill=(125, 125, 125))
+
+    draw.rectangle([(0, 0), (left_mask_width, height)], fill=(125, 125, 125))
 
     all_versions = []
 
@@ -56,9 +63,9 @@ def preprocess_image_tf(image_path, angles=[90, 180, 270], target_size=(255, 300
             pad_w - pad_w // 2,
             pad_h - pad_h // 2
         )
-        padded = ImageOps.expand(rotated, padding, fill=(0, 0, 0))
+        padded = ImageOps.expand(rotated, padding, fill=(125, 125, 125))
 
-        image_tensor = (tf.convert_to_tensor(np.array(padded), dtype=tf.float32) / 255)
+        image_tensor = (tf.convert_to_tensor(np.array(padded), dtype=tf.float16) / 127.5) - 1
 
         all_versions.append(image_tensor)
 
