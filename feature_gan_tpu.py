@@ -6,11 +6,9 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from rotator import image_generator
 os.chdir(os.path.dirname(__file__))
-try:
-    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection
-    print('Running on TPU:', tpu.cluster_spec().as_dict()['worker'])
-except ValueError:
-    print('TPU not found')
+tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection
+print('Running on TPU:', tpu.cluster_spec().as_dict()['worker'])
+
 tf.config.experimental_connect_to_cluster(tpu)
 tf.tpu.experimental.initialize_tpu_system(tpu)
 
