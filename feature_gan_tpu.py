@@ -6,13 +6,19 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from rotator import image_generator
 os.chdir(os.path.dirname(__file__))
-tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection
-print('Running on TPU:', tpu.cluster_spec().as_dict()['worker'])
+TPU_NAME = 'node-1'
+TPU_ZONE = 'europe-west4-b'
 
-tf.config.experimental_connect_to_cluster(tpu)
-tf.tpu.experimental.initialize_tpu_system(tpu)
+resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
+    tpu=TPU_NAME,
+    zone=TPU_ZONE
+)
+tf.config.experimental_connect_to_cluster(resolver)
+tf.tpu.experimental.initialize_tpu_system(resolver)
+strategy = tf.distribute.TPUStrategy(resolver)
 
-strategy = tf.distribute.TPUStrategy(tpu)
+
+
 IMG_HEIGHT, IMG_WIDTH = 225, 300
 CHANNELS = 3
 NOISE_DIM = 100
