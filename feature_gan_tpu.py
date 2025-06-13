@@ -6,7 +6,7 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from rotator import image_generator
 os.chdir(os.path.dirname(__file__))
-TPU_NAME = 'node-1'
+TPU_NAME = 'pietruszka'
 TPU_ZONE = 'europe-west4-b'
 
 resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
