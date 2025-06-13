@@ -6,16 +6,10 @@ import tensorflow as tf
 import matplotlib.pyplot as plt
 from rotator import image_generator
 os.chdir(os.path.dirname(__file__))
-TPU_NAME = 'pietruszka'
-TPU_ZONE = 'europe-west4-b'
 
-resolver = tf.distribute.cluster_resolver.TPUClusterResolver(
-    tpu=TPU_NAME,
-    zone=TPU_ZONE
-)
-tf.config.experimental_connect_to_cluster(resolver)
-tf.tpu.experimental.initialize_tpu_system(resolver)
-strategy = tf.distribute.TPUStrategy(resolver)
+
+
+strategy = tf.distribute.TPUStrategy()
 
 
 
