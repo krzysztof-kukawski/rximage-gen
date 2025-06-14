@@ -16,18 +16,31 @@ import torch_xla.runtime as xr
 
 DATA_DIR = "data/300"
 NUM_EPOCHS = 1200
-BATCH_SIZE = 64  # Reduced from 200 to 64 (divisible by 8)
+BATCH_SIZE = 128  # Reduced from 200 to 64 (divisible by 8)
 NOISE_DIM = 100
 NUM_WORKERS = 1
 LEARNING_RATE = 0.0002
 BETA1 = 0.5
 BETA2 = 0.999
-FEATURE_MATCHING_LAMBDA = 10.0
+FEATURE_MATCHING_LAMBDA = 1.0
 IMG_HEIGHT = 224
 IMG_WIDTH = 296
-LOG_STEPS = 10  # Reduced logging frequency
+LOG_STEPS = 1  # Reduced logging frequency
 from torch.nn.utils import spectral_norm
+class ResidualBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.LeakyReLU(inplace=True, negative_slope=0.2),
+            nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(channels)
+        )
+        self.leaky = nn.LeakyReLU(inplace=True, negative_slope=0.2)
 
+    def forward(self, x):
+        return self.leaky(x + self.block(x))
 
 class Generator(nn.Module):
     def __init__(self, noise_dim=100):
@@ -35,47 +48,36 @@ class Generator(nn.Module):
         self.init_h, self.init_w = 7, 9
         self.fc = nn.Linear(noise_dim, 512 * self.init_h * self.init_w)
 
+        def up_block(in_channels, out_channels):
+            return nn.Sequential(
+                nn.ConvTranspose2d(in_channels, out_channels, 4, stride=2, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.LeakyReLU(inplace=True, negative_slope=0.2),
+                ResidualBlock(out_channels)  # Add ResBlock after upsampling
+            )
+
         self.main = nn.Sequential(
-            # Unflatten and prepare
             nn.Unflatten(1, (512, self.init_h, self.init_w)),
-            nn.BatchNorm2d(512), nn.ReLU(True),
+            nn.BatchNorm2d(512), nn.LeakyReLU(inplace=True, negative_slope=0.2),
 
-            # (512, 7, 9) -> (256, 14, 18)
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(256), nn.ReLU(True),
-            
-            # (256, 14, 18) -> (128, 28, 36)
-            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(128), nn.ReLU(True),
-            
-            # (128, 28, 36) -> (64, 56, 72)
-            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(64), nn.ReLU(True),
+            up_block(512, 256),  # (7x9) -> (14x18)
+            up_block(256, 128),  # (14x18) -> (28x36)
+            up_block(128, 64),   # (28x36) -> (56x72)
+            up_block(64, 32),    # (56x72) -> (112x144)
+            up_block(32, 16),    # (112x144) -> (224x288)
 
-            # (64, 56, 72) -> (32, 112, 144)
-            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32), nn.ReLU(True),
-
-            # (32, 112, 144) -> (16, 224, 288)
-            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16), nn.ReLU(True),
-
-            # Final layer - use padding to get exact size
-            nn.Conv2d(16, 3, kernel_size=9, stride=1, padding=0),  # This should output (224, 280)
+            nn.Conv2d(16, 3, kernel_size=9, stride=1, padding=0),  # Final output layer
             nn.Tanh()
         )
-        
-        # Add a final resize layer if needed
+
         self.final_resize = transforms.Resize((IMG_HEIGHT, IMG_WIDTH))
 
     def forward(self, x):
         x = self.main(self.fc(x))
-        # Apply resize if the dimensions don't match exactly
         if x.shape[-2:] != (IMG_HEIGHT, IMG_WIDTH):
             x = self.final_resize(x)
         return x
-
-
+    
 class Discriminator(nn.Module):
     def __init__(self, input_shape=(3, IMG_HEIGHT, IMG_WIDTH)):
         super(Discriminator, self).__init__()
@@ -92,6 +94,7 @@ class Discriminator(nn.Module):
 
             spectral_norm(nn.Conv2d(256, 512, 4, stride=2, padding=1)), # 14x18
             nn.LeakyReLU(0.2, inplace=True),
+            
         )
         
         with torch.no_grad():
@@ -205,8 +208,7 @@ def _mp_fn(rank, data_dir):
         train_sampler.set_epoch(epoch)
         train_loader_for_epoch = para_loader.per_device_loader(device)
 
-        if xm.is_master_ordinal():
-            pbar = tqdm(desc=f"Epoch {epoch+1}")
+        
         
         step = 0
         for batch_data in train_loader_for_epoch:
@@ -254,14 +256,13 @@ def _mp_fn(rank, data_dir):
             xm.optimizer_step(g_optimizer, barrier=True)
             
             step += 1
-            if xm.is_master_ordinal() and step % LOG_STEPS == 0:
+            if step % LOG_STEPS == 0:
                 print(
                     f"[Epoch {epoch+1}/{NUM_EPOCHS}, Step {step}] "
                     f"D_Loss: {d_loss.item():.4f}, G_Loss: {g_loss.item():.4f}, "
                     f"Time: {time.asctime()}"
                 )
-                pbar.set_postfix(D_Loss=d_loss.item(), G_Loss=g_loss.item())
-                pbar.update(LOG_STEPS)
+                
         
         # End of epoch actions
         xm.rendezvous('epoch_end')
