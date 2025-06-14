@@ -1,7 +1,7 @@
 import os
 import time
 from keras import Model
-from keras import layers
+from keras import layers, saving
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from rotator import image_generator
@@ -19,7 +19,7 @@ if gpus:
 IMG_HEIGHT, IMG_WIDTH = 225, 300
 CHANNELS = 3
 NOISE_DIM = 100
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 EPOCHS = 1000
 SAVE_INTERVAL = 1
 IMAGE_DIR = "gan_generated_images"
@@ -31,7 +31,7 @@ image_paths = [
     for fname in os.listdir(images_120)
     if os.path.splitext(fname.lower())[1] in allowed_exts and "NLMIMAGE" in fname
 ]
-
+@saving.register_keras_serializable()
 class MinibatchStdDev(layers.Layer):
     def __init__(self, epsilon=1e-8, **kwargs):
         super().__init__(**kwargs)
@@ -55,7 +55,7 @@ class MinibatchStdDev(layers.Layer):
 
 def load_dataset():
     dataset = tf.data.Dataset.from_generator(
-        lambda: image_generator(image_paths, angles=[90, 180, 270], target_size=(90, 120)),
+        lambda: image_generator(image_paths, angles=[], target_size=(90, 120)),
         output_signature=tf.TensorSpec(shape=(90, 120, 3), dtype=tf.float16),
     )
     batched_dataset = dataset.shuffle(1000).batch(BATCH_SIZE, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
