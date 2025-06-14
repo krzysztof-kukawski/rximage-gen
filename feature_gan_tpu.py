@@ -3,322 +3,243 @@ import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader, distributed
+from torchvision import transforms, utils
 from PIL import Image
-import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
+
 import torch_xla.core.xla_model as xm
-from torch_xla.distributed.parallel_loader import MpDeviceLoader
+import torch_xla.distributed.parallel_loader as pl
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.runtime as xr
+
+DATA_DIR = "data/300"
+NUM_EPOCHS = 200
+BATCH_SIZE = 200
+NOISE_DIM = 100
+NUM_WORKERS = os.cpu_count() 
+LEARNING_RATE = 0.0002
+BETA1 = 0.5
+BETA2 = 0.999
+FEATURE_MATCHING_LAMBDA = 10.0
+IMG_HEIGHT = 224
+IMG_WIDTH = 296
+
+from torch.nn.utils import spectral_norm
+def get_image_paths(data_dir):
+    allowed_exts = [".png", ".jpg", ".jpeg"]
+    return [
+        os.path.join(data_dir, fname)
+        for fname in os.listdir(data_dir)
+        if os.path.splitext(fname.lower())[1] in allowed_exts and "NLMIMAGE" in fname
+    ]
 
 class Generator(nn.Module):
     def __init__(self, noise_dim=100):
         super(Generator, self).__init__()
-        self.noise_dim = noise_dim
-        
-        self.fc = nn.Linear(noise_dim, 9 * 10 * 256, bias=False)
-        self.bn0 = nn.BatchNorm1d(9 * 10 * 256)
-        
-        self.conv1_transpose = nn.ConvTranspose2d(256, 256, 3, stride=2, padding=1, output_padding=1, bias=False)
-        self.bn1_transpose = nn.BatchNorm2d(256)
-        self.conv1 = nn.Conv2d(256, 256, 3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(256)
-        
-        self.conv2_transpose = nn.ConvTranspose2d(256, 128, 3, stride=2, padding=1, output_padding=1, bias=False)
-        self.bn2_transpose = nn.BatchNorm2d(128)
-        self.conv2 = nn.Conv2d(128, 128, 3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(128)
-        
-        self.conv3_transpose = nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1, bias=False)
-        self.bn3_transpose = nn.BatchNorm2d(64)
-        self.conv3 = nn.Conv2d(64, 64, 3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(64)
-        
-        self.conv4_transpose = nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1, bias=False)
-        self.bn4_transpose = nn.BatchNorm2d(32)
-        self.conv4 = nn.Conv2d(32, 32, 3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(32)
-        
-        self.conv5_transpose = nn.ConvTranspose2d(32, 16, 3, stride=2, padding=1, output_padding=1, bias=False)
-        self.bn5_transpose = nn.BatchNorm2d(16)
-        self.conv5 = nn.Conv2d(16, 16, 3, stride=1, padding=1)
-        self.bn5 = nn.BatchNorm2d(16)
-        
-        self.final_conv = nn.Conv2d(16, 3, kernel_size=(64, 21), stride=1, padding=0)
-        
-        self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
-    
+        self.init_h, self.init_w = 7, 9
+        self.fc = nn.Linear(noise_dim, 512 * self.init_h * self.init_w)
+
+        self.main = nn.Sequential(
+            # Unflatten and prepare
+            nn.Unflatten(1, (512, self.init_h, self.init_w)),
+            nn.BatchNorm2d(512), nn.ReLU(True),
+
+            # (512, 7, 9) -> (256, 14, 18)
+            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(256), nn.ReLU(True),
+            
+            # (256, 14, 18) -> (128, 28, 36)
+            nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(128), nn.ReLU(True),
+            
+            # (128, 28, 36) -> (64, 56, 72)
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(64), nn.ReLU(True),
+
+            # (64, 56, 72) -> (32, 112, 144)
+            nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32), nn.ReLU(True),
+
+            # (32, 112, 144) -> (16, 224, 288)
+            nn.ConvTranspose2d(32, 16, 4, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(16), nn.ReLU(True),
+
+            # Final layer to adjust size and channels
+            nn.Conv2d(16, 3, kernel_size=3, stride=1, padding=1),
+            transforms.CenterCrop((IMG_HEIGHT, IMG_WIDTH)),
+            nn.Tanh()
+        )
+
     def forward(self, x):
-        x = self.fc(x)
-        x = self.bn0(x)
-        x = self.relu(x)
-        x = x.view(-1, 256, 9, 10)
-        
-        # Block 1
-        x = self.conv1_transpose(x)
-        x = self.bn1_transpose(x)
-        x = self.relu(x)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        
-        # Block 2
-        x = self.conv2_transpose(x)
-        x = self.bn2_transpose(x)
-        x = self.relu(x)
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.relu(x)
-        
-        # Block 3
-        x = self.conv3_transpose(x)
-        x = self.bn3_transpose(x)
-        x = self.relu(x)
-        x = self.conv3(x)
-        x = self.bn3(x)
-        x = self.relu(x)
-        
-        x = self.conv4_transpose(x)
-        x = self.bn4_transpose(x)
-        x = self.relu(x)
-        x = self.conv4(x)
-        x = self.bn4(x)
-        x = self.relu(x)
-        
-        x = self.conv5_transpose(x)
-        x = self.bn5_transpose(x)
-        x = self.relu(x)
-        x = self.conv5(x)
-        x = self.bn5(x)
-        x = self.relu(x)
-        
-        # Final layer
-        x = self.final_conv(x)
-        x = self.tanh(x)
-        
-        return x
+        return self.main(self.fc(x))
 
 
 class Discriminator(nn.Module):
-    def __init__(self):
+    def __init__(self, input_shape=(3, IMG_HEIGHT, IMG_WIDTH)):
         super(Discriminator, self).__init__()
         
-        self.conv1 = SpectralNorm(nn.Conv2d(3, 32, 3, stride=2, padding=1))
-        self.conv2 = SpectralNorm(nn.Conv2d(32, 64, 3, stride=2, padding=1))
-        self.conv3 = SpectralNorm(nn.Conv2d(64, 128, 3, stride=2, padding=1))
+        self.conv_layers = nn.Sequential(
+            spectral_norm(nn.Conv2d(input_shape[0], 64, 4, stride=2, padding=1)), # 112x148
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)), # 56x74
+            nn.LeakyReLU(0.2, inplace=True),
+            
+            spectral_norm(nn.Conv2d(128, 256, 4, stride=2, padding=1)), # 28x37
+            nn.LeakyReLU(0.2, inplace=True),
+
+            spectral_norm(nn.Conv2d(256, 512, 4, stride=2, padding=1)), # 14x18
+            nn.LeakyReLU(0.2, inplace=True),
+        )
         
-        self.leaky_relu = nn.LeakyReLU(0.2)
-       
-        self.fc = nn.Linear(128 * 29 * 38, 1)
-        
-    def forward(self, x, return_features=False):
+        with torch.no_grad():
+            dummy_input = torch.zeros(1, *input_shape)
+            dummy_output = self.conv_layers(dummy_input)
+            flattened_size = int(np.prod(dummy_output.shape[1:]))
+
+        self.fc = nn.Linear(flattened_size, 1)
+
+    def forward(self, x):
         features = []
-        
-        x = self.conv1(x)
-        x = self.leaky_relu(x)
-        if return_features:
-            features.append(x.clone())
-        
-        x = self.conv2(x)
-        x = self.leaky_relu(x)
-        
-        x = self.conv3(x)
-        x = self.leaky_relu(x)
-        if return_features:
-            features.append(x.clone())
+        for layer in self.conv_layers:
+            x = layer(x)
+            if isinstance(layer, nn.LeakyReLU):
+                features.append(x)
         
         x = x.view(x.size(0), -1)
         x = self.fc(x)
-        
-        if return_features:
-            return x, features
-        return x
-
-
-def generator_loss_with_feature_matching(fake_images, real_images, discriminator, epoch):
-    fake_output = discriminator(fake_images)
-    adv_loss = F.binary_cross_entropy_with_logits(fake_output, torch.ones_like(fake_output))
-    
-    with torch.no_grad():
-        _, real_features = discriminator(real_images, return_features=True)
-    _, fake_features = discriminator(fake_images, return_features=True)
-    
-    fm_losses = []
-    for real_feat, fake_feat in zip(real_features, fake_features):
-        real_mean = torch.mean(real_feat, dim=0)
-        fake_mean = torch.mean(fake_feat, dim=0)
-        fm_loss = torch.mean((real_mean - fake_mean) ** 2)
-        fm_losses.append(fm_loss)
-    
-    fm_loss = sum(fm_losses)
-    
-    lambda_fm = min(1.0, epoch / 100.0)
-    total_loss = adv_loss + lambda_fm * fm_loss
-    
-    return total_loss
-
-# Device
-device = xm.xla_device()
-
-# Hyperparameters
-IMG_HEIGHT, IMG_WIDTH = 225, 300
-CHANNELS = 3
-NOISE_DIM = 100
-BATCH_SIZE = 64
-EPOCHS = 2
-SAVE_INTERVAL = 1
-IMAGE_DIR = "gan_generated_images"
-os.makedirs(IMAGE_DIR, exist_ok=True)
-
-images_120 = "data/300"
-allowed_exts = [".png", ".jpg", ".jpeg"]
-image_paths = [
-    os.path.join(images_120, fname)
-    for fname in os.listdir(images_120)[:2]
-    if os.path.splitext(fname.lower())[1] in allowed_exts and "NLMIMAGE" in fname
-]
-
-image_paths = image_paths 
-
-transform = transforms.Compose([
-    transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
-    transforms.ToTensor(),
-])
+        return x, features
 
 class CustomDataset(Dataset):
-    def __init__(self, image_paths):
+    def __init__(self, image_paths, transform):
         self.image_paths = image_paths
+        self.transform = transform
 
     def __len__(self):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        return transform(image)
-
-class SpectralNorm(nn.Module):
-    def __init__(self, module, name='weight', n_power_iterations=1):
-        super(SpectralNorm, self).__init__()
-        self.module = module
-        self.name = name
-        self.n_power_iterations = n_power_iterations
-        if not self._made_params():
-            self._make_params()
-
-    def _update_u_v(self):
-        u = getattr(self.module, self.name + "_u")
-        v = getattr(self.module, self.name + "_v")
-        w = getattr(self.module, self.name + "_bar")
-
-        height = w.data.shape[0]
-        for _ in range(self.n_power_iterations):
-            v.data = F.normalize(torch.mv(torch.t(w.view(height, -1).data), u.data), dim=0)
-            u.data = F.normalize(torch.mv(w.view(height, -1).data, v.data), dim=0)
-
-        sigma = u.dot(w.view(height, -1).mv(v))
-        setattr(self.module, self.name, w / sigma.expand_as(w))
-
-    def _made_params(self):
         try:
-            getattr(self.module, self.name + "_u")
-            getattr(self.module, self.name + "_v")
-            getattr(self.module, self.name + "_bar")
-            return True
-        except AttributeError:
-            return False
+            image = Image.open(self.image_paths[idx]).convert("RGB")
+            return self.transform(image)
+        except Exception as e:
+            print(f"Warning: Skipping corrupted image {self.image_paths[idx]}: {e}")
+            return self.__getitem__((idx + 1) % len(self))
 
-    def _make_params(self):
-        w = getattr(self.module, self.name)
-        height = w.data.shape[0]
-        width = w.view(height, -1).data.shape[1]
+def get_image_paths():
+    allowed_exts = [".png", ".jpg", ".jpeg"]
+    return [
+        os.path.join(DATA_DIR, fname)
+        for fname in os.listdir(DATA_DIR)
+        if os.path.splitext(fname.lower())[1] in allowed_exts and "NLMIMAGE" in fname
+    ]
 
-        u = nn.Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        v = nn.Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
-        u.data = F.normalize(u.data, dim=0)
-        v.data = F.normalize(v.data, dim=0)
-        w_bar = nn.Parameter(w.data)
-
-        del self.module._parameters[self.name]
-        self.module.register_parameter(self.name + "_u", u)
-        self.module.register_parameter(self.name + "_v", v)
-        self.module.register_parameter(self.name + "_bar", w_bar)
-
-    def forward(self, *args):
-        self._update_u_v()
-        return self.module.forward(*args)
-
-
-def train_step(real_images, generator, discriminator, g_optimizer, d_optimizer, criterion, epoch):
-    batch_size = real_images.size(0)
-    d_optimizer.zero_grad()
-    real_output = discriminator(real_images)
-    real_labels = torch.ones_like(real_output) * 0.9
-    d_loss_real = criterion(real_output, real_labels)
-
-    noise = torch.randn(batch_size, NOISE_DIM, device=device)
-    fake_images = generator(noise)
-    fake_output = discriminator(fake_images.detach())
-    fake_labels = torch.zeros_like(fake_output)
-    d_loss_fake = criterion(fake_output, fake_labels)
-
-    d_loss = d_loss_real + d_loss_fake
-    d_loss.backward()
-    xm.optimizer_step(d_optimizer)
-    xm.mark_step()
-
-    g_optimizer.zero_grad()
-    noise = torch.randn(batch_size, NOISE_DIM, device=device)
-    fake_images = generator(noise)
-    g_loss = generator_loss_with_feature_matching(fake_images, real_images, discriminator, epoch)
-    g_loss.backward()
-    xm.optimizer_step(g_optimizer)
-    xm.mark_step()
-
-    return g_loss.item(), d_loss.item()
-
-def generate_and_save_images(generator, epoch, seed):
+def generate_and_save_images(generator, epoch, seed, device):
     generator.eval()
     with torch.no_grad():
-        predictions = generator(seed)
-        predictions = (predictions + 1.0) / 2.0
-
-        for i, img in enumerate(predictions[:24]):
-            img_np = (img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-            img_pil = Image.fromarray(img_np)
-            img_pil.save(os.path.join(IMAGE_DIR, f"epoch_{epoch:04d}_img_{i:02d}.png"))
+        predictions = generator(seed.to(device))
+        predictions = predictions.cpu()
+        predictions = predictions * 0.5 + 0.5
+        save_path = "gan_generated_images"
+        os.makedirs(save_path, exist_ok=True)
+        utils.save_image(
+            predictions,
+            os.path.join(save_path, f"epoch_{epoch:04d}.png"),
+            nrow=4,
+            normalize=False
+        )
     generator.train()
 
-if __name__ == "__main__":
-    dataset = CustomDataset(image_paths)
-    cpu_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True, num_workers=8)
-    dataloader = MpDeviceLoader(cpu_loader, device)
+def _mp_fn(rank, data_dir):
+    device = xm.xla_device()
+    world_size = xr.world_size()
+
+  
+    image_paths = get_image_paths(data_dir)
+    
+    if xm.is_master_ordinal():
+        print(f"Rank {rank} (master) found {len(image_paths)} images.")
+    xm.rendezvous('image_paths_loaded')
+
+
+    transform = transforms.Compose([
+		transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
+		transforms.ToTensor(),
+		transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+	])
+    
+    dataset = CustomDataset(image_paths, transform)
+
+    train_sampler = distributed.DistributedSampler(
+        dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True
+    )
+    
+    cpu_loader = DataLoader(
+        dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
+        num_workers=NUM_WORKERS, pin_memory=True, drop_last=True
+    )
+    
+    para_loader = pl.ParallelLoader(cpu_loader, [device])
+    train_loader = para_loader.per_device_loader(device)
 
     generator = Generator(NOISE_DIM).to(device)
-    discriminator = Discriminator().to(device)
+    discriminator = Discriminator(input_shape=(3, IMG_HEIGHT, IMG_WIDTH)).to(device)
 
-    g_optimizer = optim.Adam(generator.parameters(), lr=0.0006, betas=(0.5, 0.999))
-    d_optimizer = optim.Adam(discriminator.parameters(), lr=0.0006, betas=(0.5, 0.999))
+    g_optimizer = optim.Adam(generator.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
+    d_optimizer = optim.Adam(discriminator.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
+    
+    
 
-    criterion = nn.BCEWithLogitsLoss()
+    for epoch in range(NUM_EPOCHS):
+        train_sampler.set_epoch(epoch)
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{NUM_EPOCHS}", disable=not xm.is_master_ordinal())
+        
+        d_loss_tracker = 0.0
+        g_loss_tracker = 0.0
 
-    seed = torch.randn(BATCH_SIZE, NOISE_DIM, device=device)
-    s = 1
+        for step, real_images in enumerate(pbar):
+           
+            d_loss.backward()
+            xm.optimizer_step(d_optimizer, barrier=True)
 
-    for epoch in range(EPOCHS):
-        start_time = time.time()
+           
+            g_loss.backward()
+            xm.optimizer_step(g_optimizer, barrier=True)
+            
+            d_loss_tracker += d_loss.detach()
+            g_loss_tracker += g_loss.detach()
 
-        for step, real_images in enumerate(dataloader):
-            real_images = real_images.to(device)
-            g_loss, d_loss = train_step(real_images, generator, discriminator, g_optimizer, d_optimizer, criterion, epoch)
-            print(f"Step {step+1}, Generator loss: {g_loss:.4f}, Discriminator loss: {d_loss:.4f}")
+            if (step + 1) % LOG_STEPS == 0:
+                avg_d_loss = xm.all_reduce(xm.REDUCE_SUM, d_loss_tracker) / (LOG_STEPS * world_size)
+                avg_g_loss = xm.all_reduce(xm.REDUCE_SUM, g_loss_tracker) / (LOG_STEPS * world_size)
+                
+                if xm.is_master_ordinal():
+                    pbar.set_postfix(D_Loss=avg_d_loss.item(), G_Loss=avg_g_loss.item(), Step=step)
+                
+                # Reset trackers
+                d_loss_tracker = 0.0
+                g_loss_tracker = 0.0
 
-        print(f"Epoch {epoch+1}, Time: {time.time()-start_time:.2f}s")
-        print(xm.get_memory_info(device))
+        # End of epoch actions
+        xm.rendezvous('epoch_end')
+        if xm.is_master_ordinal():
+            generate_and_save_images(generator, epoch + 1, seed, device)
+            # Save checkpoints
+            xm.save(generator.state_dict(), f"generator_epoch_{epoch+1}.pt")
+            xm.save(discriminator.state_dict(), f"discriminator_epoch_{epoch+1}.pt")
 
-        if (epoch + 1) % SAVE_INTERVAL == 0:
-            generate_and_save_images(generator, epoch + 1, seed)
-            torch.save(generator.state_dict(), f"feature_gan_gen{s}.pth")
-            torch.save(discriminator.state_dict(), f"feature_gan_disc{s}.pth")
-            s = 1 if s == 2 else 2
+
+
+def main():
+    
+    print(f"Starting training process for data in: {DATA_DIR}")
+
+    
+    xmp.spawn(_mp_fn, args=(DATA_DIR,), start_method='spawn')
+
+
+if __name__ == "__main__":
+    main()
