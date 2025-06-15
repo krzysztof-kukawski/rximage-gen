@@ -7,26 +7,25 @@ from torch.utils.data import Dataset, DataLoader, distributed
 from torchvision import transforms, utils
 from PIL import Image
 import numpy as np
-from tqdm import tqdm
 
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch_xla.runtime as xr
+from torch.nn.utils import spectral_norm
 
 DATA_DIR = "data/300"
-NUM_EPOCHS = 1200
-BATCH_SIZE = 128  # Reduced from 200 to 64 (divisible by 8)
-NOISE_DIM = 100
+NUM_EPOCHS = 5000
+BATCH_SIZE = 64  
+NOISE_DIM = 120
 NUM_WORKERS = 1
 LEARNING_RATE = 0.0002
 BETA1 = 0.5
 BETA2 = 0.999
-FEATURE_MATCHING_LAMBDA = 1.0
+FEATURE_MATCHING_LAMBDA = 10.0
 IMG_HEIGHT = 224
 IMG_WIDTH = 296
 LOG_STEPS = 1  # Reduced logging frequency
-from torch.nn.utils import spectral_norm
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super().__init__()
@@ -83,16 +82,17 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         
         self.conv_layers = nn.Sequential(
-            spectral_norm(nn.Conv2d(input_shape[0], 64, 4, stride=2, padding=1)), # 112x148
+            spectral_norm(nn.Conv2d(input_shape[0], 32, 4, stride=2, padding=1)), # 112x148
             nn.LeakyReLU(0.2, inplace=True),
-            
-            spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)), # 56x74
+            nn.Dropout2d(0.2),
+            spectral_norm(nn.Conv2d(32, 64, 4, stride=2, padding=1)), # 56x74
             nn.LeakyReLU(0.2, inplace=True),
-            
-            spectral_norm(nn.Conv2d(128, 256, 4, stride=2, padding=1)), # 28x37
+            nn.Dropout2d(0.2),
+            spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)), # 28x37
             nn.LeakyReLU(0.2, inplace=True),
+            nn.Dropout2d(0.2),
 
-            spectral_norm(nn.Conv2d(256, 512, 4, stride=2, padding=1)), # 14x18
+            spectral_norm(nn.Conv2d(128, 256, 4, stride=2, padding=1)), # 14x18
             nn.LeakyReLU(0.2, inplace=True),
             
         )
