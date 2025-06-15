@@ -16,7 +16,7 @@ from torch.nn.utils import spectral_norm
 
 DATA_DIR = "data/300"
 NUM_EPOCHS = 5000
-BATCH_SIZE = 64  
+BATCH_SIZE = 128
 NOISE_DIM = 120
 NUM_WORKERS = 1
 LEARNING_RATE = 0.0002
@@ -82,15 +82,15 @@ class Discriminator(nn.Module):
         super(Discriminator, self).__init__()
         
         self.conv_layers = nn.Sequential(
-            spectral_norm(nn.Conv2d(input_shape[0], 32, 4, stride=2, padding=1)), # 112x148
+            spectral_norm(nn.Conv2d(input_shape[0], 32, 4, stride=1, padding=1)), # 112x148
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.2),
+            nn.Dropout2d(0.3),
             spectral_norm(nn.Conv2d(32, 64, 4, stride=2, padding=1)), # 56x74
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.2),
+            nn.Dropout2d(0.3),
             spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)), # 28x37
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.2),
+            nn.Dropout2d(0.3),
 
             spectral_norm(nn.Conv2d(128, 256, 4, stride=2, padding=1)), # 14x18
             nn.LeakyReLU(0.2, inplace=True),
@@ -209,52 +209,74 @@ def _mp_fn(rank, data_dir):
         train_loader_for_epoch = para_loader.per_device_loader(device)
 
         
-        
         step = 0
+        r1_gamma = 10.0  # Strength of R1 regularization
+
         for batch_data in train_loader_for_epoch:
-            real_images = batch_data[0]  # Unpack here instead
+            real_images = batch_data[0].to(device)  # Ensure images are on correct device
+
             # === Train Discriminator ===
             d_optimizer.zero_grad()
 
-            # 1. Loss on real images
+            # 1. Real loss with label smoothing (e.g., 0.9 instead of 1.0)
+            real_images.requires_grad_()
             real_output, _ = discriminator(real_images)
-            d_loss_real = bce_loss(real_output, torch.ones_like(real_output))
+            real_labels = torch.full_like(real_output, 0.9)  # label smoothing
+            d_loss_real = bce_loss(real_output, real_labels)
 
-            # 2. Loss on fake images
+            # 2. Fake loss
             noise = torch.randn(real_images.size(0), NOISE_DIM, device=device)
             fake_images = generator(noise)
             fake_output, _ = discriminator(fake_images.detach())
-            d_loss_fake = bce_loss(fake_output, torch.zeros_like(fake_output))
+            fake_labels = torch.zeros_like(fake_output)
+            d_loss_fake = bce_loss(fake_output, fake_labels)
 
-            # 3. Combine losses
-            d_loss = d_loss_real + d_loss_fake
+            # 3. R1 regularization (gradient penalty on real images)
+            grad_outputs = torch.ones_like(real_output)
+            grads = torch.autograd.grad(
+                outputs=real_output,
+                inputs=real_images,
+                grad_outputs=grad_outputs,
+                create_graph=True,
+                retain_graph=True,
+                only_inputs=True
+            )[0]
+            r1_penalty = grads.pow(2).sum([1, 2, 3]).mean()
+
+            # 4. Combine discriminator losses
+            d_loss = d_loss_real + d_loss_fake + r1_gamma * r1_penalty
             d_loss.backward()
             xm.optimizer_step(d_optimizer, barrier=True)
 
             # === Train Generator ===
-            g_optimizer.zero_grad()
-            
-            # Re-run forward pass for generator
-            noise = torch.randn(real_images.size(0), NOISE_DIM, device=device)
-            fake_images_for_g = generator(noise)
-            fake_output_for_g, fake_features = discriminator(fake_images_for_g)
-            
-            # Adversarial Loss
-            g_loss_adv = bce_loss(fake_output_for_g, torch.ones_like(fake_output_for_g))
+            gen_inc = 1
+            if d_loss.item() < 0.5:
+                gen_inc = 3
 
-            # Feature Matching Loss
-            with torch.no_grad():
-                _, real_features = discriminator(real_images)
-                
-            g_loss_fm = 0
-            for real_feat, fake_feat in zip(real_features, fake_features):
-                g_loss_fm += l1_loss(real_feat.mean(0), fake_feat.mean(0))
+            for _ in range(gen_inc):
+                g_optimizer.zero_grad()
 
-            # Combine generator losses
-            g_loss = g_loss_adv + FEATURE_MATCHING_LAMBDA * g_loss_fm
-            g_loss.backward()
-            xm.optimizer_step(g_optimizer, barrier=True)
-            
+                # Generator forward pass
+                noise = torch.randn(real_images.size(0), NOISE_DIM, device=device)
+                fake_images_for_g = generator(noise)
+                fake_output_for_g, fake_features = discriminator(fake_images_for_g)
+
+                # Adversarial loss (G tries to fool D)
+                g_loss_adv = bce_loss(fake_output_for_g, torch.ones_like(fake_output_for_g))
+
+                # Feature Matching Loss
+                with torch.no_grad():
+                    _, real_features = discriminator(real_images)
+
+                g_loss_fm = 0
+                for real_feat, fake_feat in zip(real_features, fake_features):
+                    g_loss_fm += l1_loss(real_feat.mean(0), fake_feat.mean(0))
+
+                # Combine generator losses
+                g_loss = g_loss_adv + FEATURE_MATCHING_LAMBDA * g_loss_fm
+                g_loss.backward()
+                xm.optimizer_step(g_optimizer, barrier=True)
+
             step += 1
             if step % LOG_STEPS == 0:
                 print(
