@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader, distributed
 from torchvision import transforms, utils
 from PIL import Image
 import numpy as np
-
+import copy
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.parallel_loader as pl
 import torch_xla.distributed.xla_multiprocessing as xmp
@@ -18,13 +18,13 @@ from torch.nn.utils import spectral_norm
 
 DATA_DIR = "data/300"
 NUM_EPOCHS = 5000
-BATCH_SIZE = 32
+BATCH_SIZE = 128
 NOISE_DIM = 120
 NUM_WORKERS = 1
-LEARNING_RATE = 0.0005
+LEARNING_RATE = 0.0002
 BETA1 = 0.5
 BETA2 = 0.999
-FEATURE_MATCHING_LAMBDA = 10.0
+FEATURE_MATCHING_LAMBDA = 1.0
 IMG_HEIGHT = 224
 IMG_WIDTH = 296
 LOG_STEPS = 1
@@ -148,7 +148,12 @@ def generate_and_save_images(generator, epoch, seed, device):
         os.makedirs("gan_generated_images", exist_ok=True)
         utils.save_image(predictions, f"gan_generated_images/epoch_{epoch:04d}.png", nrow=4)
     generator.train()
-
+    
+@torch.no_grad()
+def update_ema(ema_model, model, decay):
+    for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+        ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
+        
 def _mp_fn(rank, data_dir):
     device = xm.xla_device()
     world_size = xr.world_size()
@@ -171,6 +176,7 @@ def _mp_fn(rank, data_dir):
     state_dict = torch.load("relaxed_generator.pt", map_location="cpu")
     generator.load_state_dict(state_dict)
     generator.to(device)
+    
     #generator.load_state_dict(torch.load("generator.pt", map_location=device))
     state_dict = torch.load("relaxed_discriminator.pt", map_location="cpu")
     discriminator.load_state_dict(state_dict)
@@ -187,7 +193,9 @@ def _mp_fn(rank, data_dir):
         para_loader = pl.ParallelLoader(cpu_loader, [device])
         train_sampler.set_epoch(epoch)
         loader = para_loader.per_device_loader(device)
-
+        ema_generator = copy.deepcopy(generator)
+        ema_generator.eval()  
+        ema_decay = 0.999
         r1_gamma = 0.1
         for step, batch_data in enumerate(loader):
             real_images = batch_data[0].to(device)
@@ -208,7 +216,11 @@ def _mp_fn(rank, data_dir):
             d_loss.backward()
             xm.optimizer_step(d_optimizer, barrier=True)
 
-            gen_inc = 1 if d_loss.item() >= 0.5 else 3
+            d_loss_scalar = d_loss.detach()
+            d_loss_scalar = xm.mesh_reduce('d_loss_scalar', d_loss_scalar, lambda x: sum(x) / len(x))
+
+            gen_inc = 1 if d_loss_scalar >= 0.5 else 3
+
             for _ in range(gen_inc):
                 g_optimizer.zero_grad()
                 noise = torch.randn(real_images.size(0), NOISE_DIM, device=device)
@@ -221,15 +233,16 @@ def _mp_fn(rank, data_dir):
                 g_loss = g_loss_adv + FEATURE_MATCHING_LAMBDA * g_loss_fm
                 g_loss.backward()
                 xm.optimizer_step(g_optimizer, barrier=True)
-
+                update_ema(ema_generator, generator, ema_decay)
             if step % LOG_STEPS == 0:
                 print(f"[Epoch {epoch+1}/{NUM_EPOCHS}, Step {step}] D_Loss: {d_loss.item():.4f}, G_Loss: {g_loss.item():.4f}, Time: {time.asctime()}")
 
         xm.rendezvous('epoch_end')
         if xm.is_master_ordinal():
-            generate_and_save_images(generator, epoch + 1, seed, device)
+            generate_and_save_images(ema_generator, epoch + 1, seed, device)
             xm.save(generator.state_dict(), f"relaxed_generator.pt")
             xm.save(discriminator.state_dict(), f"relaxed_discriminator.pt")
+            xm.save(ema_generator.state_dict(), f"ema_relaxed_generator.pt")
 
 def main():
     print(f"Starting resumed training from pre-trained checkpoints with relaxed discriminator.")
