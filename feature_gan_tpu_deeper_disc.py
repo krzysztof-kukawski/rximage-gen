@@ -22,17 +22,17 @@ import math
 
 DATA_DIR = "data/300"
 NUM_EPOCHS = 5000
-BATCH_SIZE = 64
+BATCH_SIZE = 100
 NOISE_DIM = 120
 NUM_WORKERS = 1
 LEARNING_RATE = 0.0002
 BETA1 = 0.5
 BETA2 = 0.999
-FEATURE_MATCHING_LAMBDA = 1
+FEATURE_MATCHING_LAMBDA = 2
 IMG_HEIGHT = 224
 IMG_WIDTH = 296
 LOG_STEPS = 1
-CLIP_LAMBDA = 2
+CLIP_LAMBDA = 3
 class SelfAttention(nn.Module):
     def __init__(self, in_dim):
         super().__init__()
@@ -220,9 +220,12 @@ def _mp_fn(rank, data_dir):
     cpu_loader = DataLoader(dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
                             num_workers=0, pin_memory=False, drop_last=True)
 
-    generator = EnhancedGenerator(NOISE_DIM).to(device)
-    discriminator = EnhancedDiscriminator((3, IMG_HEIGHT, IMG_WIDTH)).to(device)
-
+    generator = EnhancedGenerator(NOISE_DIM)
+    discriminator = EnhancedDiscriminator((3, IMG_HEIGHT, IMG_WIDTH))
+    generator.load_state_dict(torch.load("relaxed_generator1.pt", map_location="cpu"))
+    discriminator.load_state_dict(torch.load("relaxed_discriminator1.pt", map_location="cpu"))
+    generator.to(device)
+    discriminator.to(device)
     g_optimizer = optim.Adam(generator.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
     d_optimizer = optim.Adam(discriminator.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
 
@@ -238,7 +241,7 @@ def _mp_fn(rank, data_dir):
         return (images - mean) / std
 
     ema_decay = 0.999
-    r1_gamma = 2.0
+    r1_gamma = 2.5
 
     for epoch in range(NUM_EPOCHS):
         ema_generator = copy.deepcopy(generator).eval()
