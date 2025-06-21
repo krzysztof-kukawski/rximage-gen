@@ -22,17 +22,17 @@ import math
 
 DATA_DIR = "data/300"
 NUM_EPOCHS = 5000
-BATCH_SIZE = 100
+BATCH_SIZE = 64
 NOISE_DIM = 120
 NUM_WORKERS = 1
 LEARNING_RATE = 0.0002
-BETA1 = 0.5
+BETA1 = 0.0
 BETA2 = 0.999
-FEATURE_MATCHING_LAMBDA = 2
+FEATURE_MATCHING_LAMBDA = 20
 IMG_HEIGHT = 224
 IMG_WIDTH = 296
 LOG_STEPS = 1
-CLIP_LAMBDA = 3
+CLIP_LAMBDA = 2
 class SelfAttention(nn.Module):
     def __init__(self, in_dim):
         super().__init__()
@@ -117,20 +117,20 @@ class EnhancedDiscriminator(nn.Module):
         self.conv_layers = nn.Sequential(
             spectral_norm(nn.Conv2d(input_shape[0], 32, 4, stride=1, padding=1)),  # 112x148
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(0.3),
 
             spectral_norm(nn.Conv2d(32, 64, 4, stride=2, padding=1)),  # 56x74
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(0.3),
 
             spectral_norm(nn.Conv2d(64, 128, 4, stride=2, padding=1)),  # 28x37
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(0.3),
             SelfAttention(128),  # 👁️ Attention at 28x37
 
             spectral_norm(nn.Conv2d(128, 256, 4, stride=2, padding=1)),  # 14x18
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Dropout2d(0.1),
+            nn.Dropout2d(0.3),
             SelfAttention(256),  # 👁️ Attention at 14x18
         )
 
@@ -165,29 +165,37 @@ def get_image_paths(data_dir):
 
 class CustomDataset(Dataset):
     def __init__(self, data_dir, transform):
-        self.data_dir = data_dir
         self.transform = transform
-        self.image_paths = get_image_paths(data_dir)
-        print(f"Found {len(self.image_paths)} images in {data_dir}")
+        self.image_paths = [
+            os.path.join(data_dir, f) for f in os.listdir(data_dir)
+            if f.lower().endswith(('jpg', 'png', 'jpeg')) and 'NLMIMAGE' in f
+        ]
+
+        # Preload images into memory
+        self.images = []
+        for path in self.image_paths:
+            try:
+                img = Image.open(path).convert('RGB')
+                self.images.append(img)
+            except Exception as e:
+                print(f"Error loading image {path}: {e}")
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.images)
 
     def __getitem__(self, idx):
-        try:
-            image = Image.open(self.image_paths[idx]).convert("RGB")
-            return (self.transform(image),)
-        except Exception:
-            return self.__getitem__((idx + 1) % len(self))
+        img = self.images[idx]
+        return (self.transform(img),)
 
 
-def generate_and_save_images(generator, epoch, seed, device):
+
+def generate_and_save_images(generator, epoch, seed, device, postfix = ''):
     generator.eval()
     with torch.no_grad():
         predictions = generator(seed).cpu() * 0.5 + 0.5
         os.makedirs("gan_generated_images", exist_ok=True)
         utils.save_image(
-            predictions, f"gan_generated_images/epoch_{epoch:04d}.png", nrow=4)
+            predictions, f"gan_generated_images/epoch_{epoch:04d}{postfix}.png", nrow=4)
     generator.train()
 
 
@@ -196,6 +204,35 @@ def update_ema(ema_model, model, decay):
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
         ema_param.data.mul_(decay).add_(param.data, alpha=1 - decay)
 
+def weighted_generator_loss( d_outputs, criterion, temperature=1.0):
+    """
+    Generator loss weighted by how fake the discriminator thinks each sample is.
+
+    Args:
+        generator: your generator model
+        discriminator: your discriminator model
+        z: latent vectors (batch_size, latent_dim)
+        criterion: usually nn.BCELoss()
+        temperature: softmax temperature for weighting
+
+    Returns:
+        scalar loss value
+    """
+    
+
+    # Compute per-sample generator loss (goal: fool the discriminator into thinking it's real)
+    target_real = torch.ones_like(d_outputs)  # Generator wants D(fake) → 1
+    individual_losses = criterion(d_outputs, target_real)  # shape: [batch_size]
+
+    # Compute weights: lower D output → worse sample → higher weight
+    # We'll use softmax over "fakeness" = (1 - D_output)
+    fakeness_scores = 1.0 - d_outputs.detach()  # detach so D doesn't get gradients
+    weights = F.softmax(fakeness_scores / temperature, dim=0)  # shape: [batch_size]
+
+    # Weighted sum of losses
+    weighted_loss = torch.sum(weights * individual_losses)
+
+    return weighted_loss
 
 def _mp_fn(rank, data_dir):
     device = xm.xla_device()
@@ -216,14 +253,14 @@ def _mp_fn(rank, data_dir):
         print(f"ERROR: No images found in {data_dir}")
         return
 
-    train_sampler = distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=False, drop_last=True)
+    train_sampler = distributed.DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=True)
     cpu_loader = DataLoader(dataset, batch_size=BATCH_SIZE, sampler=train_sampler,
                             num_workers=0, pin_memory=False, drop_last=True)
 
     generator = EnhancedGenerator(NOISE_DIM)
     discriminator = EnhancedDiscriminator((3, IMG_HEIGHT, IMG_WIDTH))
-    generator.load_state_dict(torch.load("relaxed_generator1.pt", map_location="cpu"))
-    discriminator.load_state_dict(torch.load("relaxed_discriminator1.pt", map_location="cpu"))
+    generator.load_state_dict(torch.load("checkpoints/relaxed_generator6.pt", map_location="cpu"))
+    discriminator.load_state_dict(torch.load("checkpoints/relaxed_discriminator6.pt", map_location="cpu"))
     generator.to(device)
     discriminator.to(device)
     g_optimizer = optim.Adam(generator.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2))
@@ -241,10 +278,10 @@ def _mp_fn(rank, data_dir):
         return (images - mean) / std
 
     ema_decay = 0.999
-    r1_gamma = 2.5
+    r1_gamma = 1
 
     for epoch in range(NUM_EPOCHS):
-        ema_generator = copy.deepcopy(generator).eval()
+        #ema_generator = copy.deepcopy(generator).eval()
         
         para_loader = pl.ParallelLoader(cpu_loader, [device])
         loader = para_loader.per_device_loader(device)
@@ -273,18 +310,19 @@ def _mp_fn(rank, data_dir):
             r1_penalty = grads.pow(2).sum([1, 2, 3]).mean()
 
             d_loss_patch = F.mse_loss(fake_patch.mean([2, 3]), real_patch.mean([2, 3]))
-            d_loss = d_loss_real + d_loss_fake + r1_gamma * r1_penalty + 0.1 * d_loss_patch
+            d_loss = d_loss_real + d_loss_fake + r1_gamma * r1_penalty + 20 * d_loss_patch
             d_loss.backward()
             xm.optimizer_step(d_optimizer, barrier=True)
 
             #### ========== GENERATOR STEP ==========
             g_optimizer.zero_grad()
             noise = torch.randn(batch_size, NOISE_DIM, device=device)
+            noise += 0.02 * torch.randn_like(noise)
             fake_images = generator(noise)
 
             fake_logits, _, fake_feats = discriminator(fake_images)
-            g_adv_loss = bce_loss(fake_logits, torch.ones_like(fake_logits))
-
+            #g_adv_loss = bce_loss(fake_logits, torch.ones_like(fake_logits))
+            g_adv_loss = weighted_generator_loss(fake_logits, bce_loss, temperature=0.25)
             with torch.no_grad():
                 real_feats = discriminator(real_images)[-1]
             fm_loss = sum(l1_loss(f.mean(0), r.mean(0)) for f, r in zip(fake_feats, real_feats))
@@ -294,27 +332,29 @@ def _mp_fn(rank, data_dir):
             fake_clip = clip_model.encode_image(preprocess_for_clip_batch(fake_images))
             fake_clip = fake_clip / fake_clip.norm(dim=-1, keepdim=True)
             clip_loss = 1 - F.cosine_similarity(fake_clip, real_clip, dim=-1).mean()
-
-            g_loss = g_adv_loss + FEATURE_MATCHING_LAMBDA * fm_loss + CLIP_LAMBDA * clip_loss
+            clip_weight = CLIP_LAMBDA * (1 + math.sin(epoch / 120 * math.pi)) / 2
+            g_loss =  g_adv_loss + FEATURE_MATCHING_LAMBDA * fm_loss + clip_weight * clip_loss
             g_loss.backward()
             xm.optimizer_step(g_optimizer, barrier=True)
 
-            update_ema(ema_generator, generator, ema_decay)
+            #update_ema(ema_generator, generator, ema_decay)
 
             #### ========== LOGGING ==========
             if step % LOG_STEPS == 0:
                 print(
                     f"[Epoch {epoch+1}/{NUM_EPOCHS}, Step {step}] "
                     f"D_Loss: {d_loss.item():.4f}, G_Loss: {g_loss.item():.4f}, "
-                    f"CLIP_Loss: {clip_loss.item():.4f}, Time: {time.asctime()}"
+                    f"CLIP_Loss: {clip_loss.item():.4f}, "
+                    f"Time: {time.asctime()}"
                 )
 
         xm.rendezvous('epoch_end')
         if xm.is_master_ordinal():
-            generate_and_save_images(ema_generator, epoch + 1, seed, device)
-            xm.save(generator.state_dict(), f"relaxed_generator1.pt")
-            xm.save(discriminator.state_dict(), f"relaxed_discriminator1.pt")
-            xm.save(ema_generator.state_dict(), f"ema_relaxed_generator1.pt")
+            generate_and_save_images(generator, epoch + 1, seed, device)
+            generate_and_save_images(generator, epoch + 1, noise, device, postfix="_noise")
+            xm.save(generator.state_dict(), "checkpoints/relaxed_generator7.pt")
+            xm.save(discriminator.state_dict(), "checkpoints/relaxed_discriminator7.pt")
+            #xm.save(ema_generator.state_dict(), f"ema_relaxed_generator4.pt")
 
 
 def main():
